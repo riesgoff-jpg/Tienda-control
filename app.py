@@ -56,12 +56,14 @@ st.markdown("""
         font-size: 1.35rem !important;
     }
     
-    .badge-pill {
-        display: inline-block;
-        padding: 4px 10px;
-        border-radius: 9999px;
-        font-size: 0.85rem;
-        font-weight: 600;
+    .card-deudor {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-left: 5px solid #ef4444;
+        padding: 14px;
+        border-radius: 12px;
+        margin-bottom: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -71,9 +73,10 @@ CATEGORIAS = ["Refrescos", "Sabritas", "Galletas"]
 
 # --- FUNCIONES DE BASE DE DATOS (SQLite) ---
 def init_db():
-    """Inicializa la base de datos y la tabla de movimientos."""
+    """Inicializa la base de datos y todas las tablas."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    # Tabla de ventas y compras diarias
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS movimientos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +85,28 @@ def init_db():
             categoria TEXT NOT NULL,
             cantidad INTEGER NOT NULL,
             monto REAL NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Tabla de deudores (saldos acumulados)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS deudores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT UNIQUE NOT NULL,
+            saldo REAL NOT NULL DEFAULT 0.0,
+            notas TEXT,
+            fecha_actualizacion TEXT
+        )
+    """)
+    # Historial de operaciones de fiado y pagos
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS movimientos_fiado (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            monto REAL NOT NULL,
+            fecha TEXT NOT NULL,
+            notas TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -119,6 +144,97 @@ def eliminar_movimiento(id_mov):
     conn.commit()
     conn.close()
 
+# --- FUNCIONES PARA DEUDORES Y FIADO ---
+def registrar_fiado(nombre, monto, notas, fecha_str):
+    """Registra una nueva deuda o suma al saldo acumulado del cliente."""
+    nombre = nombre.strip().title()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Revisar si el cliente ya existe
+    cursor.execute("SELECT id, saldo FROM deudores WHERE LOWER(nombre) = LOWER(?)", (nombre,))
+    deudor = cursor.fetchone()
+    
+    if deudor:
+        deudor_id, saldo_anterior = deudor
+        nuevo_saldo = saldo_anterior + monto
+        cursor.execute("""
+            UPDATE deudores 
+            SET saldo = ?, notas = ?, fecha_actualizacion = ?
+            WHERE id = ?
+        """, (nuevo_saldo, notas, fecha_str, deudor_id))
+    else:
+        cursor.execute("""
+            INSERT INTO deudores (nombre, saldo, notas, fecha_actualizacion)
+            VALUES (?, ?, ?, ?)
+        """, (nombre, monto, notas, fecha_str))
+    
+    # Registrar en el historial de fiados
+    cursor.execute("""
+        INSERT INTO movimientos_fiado (nombre, tipo, monto, fecha, notas)
+        VALUES (?, 'Fiado (+)', ?, ?, ?)
+    """, (nombre, monto, fecha_str, notas))
+    
+    conn.commit()
+    conn.close()
+
+def registrar_pago_deudor(nombre, monto_pago, fecha_str):
+    """Abona o liquida la deuda de una persona."""
+    nombre = nombre.strip()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id, saldo FROM deudores WHERE LOWER(nombre) = LOWER(?)", (nombre,))
+    deudor = cursor.fetchone()
+    
+    if deudor:
+        deudor_id, saldo_actual = deudor
+        nuevo_saldo = max(0.0, saldo_actual - monto_pago)
+        
+        cursor.execute("""
+            UPDATE deudores 
+            SET saldo = ?, fecha_actualizacion = ?
+            WHERE id = ?
+        """, (nuevo_saldo, fecha_str, deudor_id))
+        
+        # Registrar en el historial
+        cursor.execute("""
+            INSERT INTO movimientos_fiado (nombre, tipo, monto, fecha, notas)
+            VALUES (?, 'Pago/Liquidación (-)', ?, ?, ?)
+        """, (nombre, monto_pago, fecha_str, f"Abono/Pago recibido: ${monto_pago:,.2f}"))
+        
+        conn.commit()
+        conn.close()
+        return nuevo_saldo, saldo_actual
+    
+    conn.close()
+    return None, None
+
+def obtener_deudores_activos():
+    """Devuelve los clientes que tienen deuda pendiente mayor a cero."""
+    conn = sqlite3.connect(DB_PATH)
+    query = "SELECT id, nombre, saldo, notas, fecha_actualizacion FROM deudores WHERE saldo > 0 ORDER BY saldo DESC, nombre ASC"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+def obtener_todos_deudores():
+    """Devuelve la lista de nombres registrados."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT nombre FROM deudores ORDER BY nombre ASC")
+    nombres = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return nombres
+
+def obtener_historial_fiado():
+    """Devuelve los últimos movimientos de fiado y pagos."""
+    conn = sqlite3.connect(DB_PATH)
+    query = "SELECT fecha, nombre, tipo, monto, notas FROM movimientos_fiado ORDER BY id DESC LIMIT 20"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
 # Inicializar BD
 init_db()
 
@@ -129,9 +245,10 @@ with col_head1:
     st.caption(f"📅 Fecha actual: **{date.today().strftime('%d/%m/%Y')}**")
 
 # Selector de pestañas móvil
-tab_venta, tab_compra, tab_metricas, tab_historial = st.tabs([
+tab_venta, tab_compra, tab_deudores, tab_metricas, tab_historial = st.tabs([
     "💵 Vender", 
     "📦 Comprar", 
+    "📒 Deudores",
     "📊 Métricas",
     "📋 Historial"
 ])
@@ -219,7 +336,152 @@ with tab_compra:
                 st.rerun()
 
 # ==========================================
-# PESTAÑA 3: MÉTRICAS Y RESUMEN DEL DÍA
+# PESTAÑA 3: DEUDORES / LO FIADO
+# ==========================================
+with tab_deudores:
+    st.markdown("#### 📒 Control de Deudores y Fiado")
+    
+    # Subpestañas o acordeones para organizar celular
+    accion_fiado = st.radio(
+        "¿Qué deseas hacer?",
+        ["👥 Ver Deudores Activos", "➕ Anotar Fiado", "💳 Registrar Pago"],
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+    
+    df_activos = obtener_deudores_activos()
+    total_por_cobrar = df_activos["saldo"].sum() if not df_activos.empty else 0.0
+    
+    # Métrica resumen del fiado
+    m_f1, m_f2 = st.columns(2)
+    with m_f1:
+        st.metric("Total por Cobrar", f"${total_por_cobrar:,.2f}")
+    with m_f2:
+        st.metric("Deudores Pendientes", f"{len(df_activos)} personas")
+    
+    st.divider()
+
+    # --- SECCIÓN 1: VER LISTA DE DEUDORES ACTIVOS ---
+    if accion_fiado == "👥 Ver Deudores Activos":
+        if df_activos.empty:
+            st.success("🎉 ¡Excelente! No hay clientes con deudas pendientes actualmente.")
+        else:
+            st.caption("Solo se muestran personas con saldo pendiente:")
+            for _, row in df_activos.iterrows():
+                with st.container():
+                    st.markdown(f"""
+                    <div class="card-deudor">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="font-size:1.15rem; font-weight:700; color:#1e293b;">👤 {row['nombre']}</span>
+                            <span style="font-size:1.25rem; font-weight:800; color:#dc2626;">${row['saldo']:,.2f}</span>
+                        </div>
+                        <div style="font-size:0.85rem; color:#64748b; margin-top:4px;">
+                            📅 Última fecha: {row['fecha_actualizacion'] or 'Reciente'}
+                            {f"<br>📝 Notas: {row['notas']}" if row['notas'] else ""}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Botón rápido para ir directo a pagar esta persona
+                    if st.button(f"💵 Pagar cuenta de {row['nombre']}", key=f"btn_pay_{row['id']}"):
+                        st.session_state["deudor_a_pagar"] = row["nombre"]
+                        st.session_state["saldo_a_pagar"] = float(row["saldo"])
+                        st.rerun()
+
+    # --- SECCIÓN 2: ANOTAR NUEVO FIADO O ACUMULAR ---
+    elif accion_fiado == "➕ Anotar Fiado":
+        st.markdown("##### 📝 Anotar mercancía fiada")
+        
+        nombres_existentes = obtener_todos_deudores()
+        usar_existente = False
+        nombre_cliente = ""
+        
+        if nombres_existentes:
+            modo_nombre = st.radio("Seleccionar cliente:", ["Escribir nuevo", "Elegir existente"], horizontal=True)
+            if modo_nombre == "Elegir existente":
+                nombre_cliente = st.selectbox("Cliente:", options=nombres_existentes)
+                usar_existente = True
+                
+        if not usar_existente:
+            nombre_cliente = st.text_input("Nombre de la persona:", placeholder="Ej. Doña Carmen, Juan Pérez")
+            
+        monto_fiado = st.number_input("Monto a fiar ($):", min_value=0.0, value=0.0, step=5.0, format="%.2f")
+        notas_fiado = st.text_input("Detalle o productos (opcional):", placeholder="Ej. 2 refrescos y 1 papas")
+        fecha_fiado = st.date_input("Fecha:", value=date.today())
+        
+        if st.button("💾 Guardar en Cuenta Fiada", type="primary"):
+            if not nombre_cliente or nombre_cliente.strip() == "":
+                st.error("⚠️ Por favor escribe el nombre del cliente.")
+            elif monto_fiado <= 0:
+                st.error("⚠️ El monto fiado debe ser mayor a $0.")
+            else:
+                registrar_fiado(nombre_cliente, monto_fiado, notas_fiado, fecha_fiado.strftime("%Y-%m-%d"))
+                st.success(f"¡Anotado con éxito! Se sumaron ${monto_fiado:,.2f} a la cuenta de {nombre_cliente.title()}.")
+                st.rerun()
+
+    # --- SECCIÓN 3: REGISTRAR PAGO / SALDAR CUENTA ---
+    elif accion_fiado == "💳 Registrar Pago":
+        st.markdown("##### 💵 Registrar Abono o Liquidación")
+        
+        if df_activos.empty:
+            st.info("No hay clientes con saldo pendiente en este momento.")
+        else:
+            # Lista de deudores activos para cobrarles
+            nombres_activos = df_activos["nombre"].tolist()
+            
+            # Si venía redirigido por el botón de pagar
+            index_defecto = 0
+            if "deudor_a_pagar" in st.session_state and st.session_state["deudor_a_pagar"] in nombres_activos:
+                index_defecto = nombres_activos.index(st.session_state["deudor_a_pagar"])
+                
+            cliente_seleccionado = st.selectbox("Selecciona la persona que va a pagar:", options=nombres_activos, index=index_defecto)
+            
+            # Obtener saldo actual de la persona seleccionada
+            fila_cliente = df_activos[df_activos["nombre"] == cliente_seleccionado].iloc[0]
+            saldo_pendiente = float(fila_cliente["saldo"])
+            
+            st.info(f"Deuda actual de **{cliente_seleccionado}**: **${saldo_pendiente:,.2f}**")
+            
+            monto_pago = st.number_input(
+                "Monto que entrega la persona ($):", 
+                min_value=0.0, 
+                max_value=saldo_pendiente,
+                value=saldo_pendiente, 
+                step=5.0, 
+                format="%.2f",
+                help="Por defecto viene el total para liquidar la cuenta completa."
+            )
+            
+            fecha_pago = st.date_input("Fecha del pago:", value=date.today(), key="fecha_pago")
+            
+            if st.button("✅ Confirmar Pago", type="primary"):
+                if monto_pago <= 0:
+                    st.error("⚠️ El monto a pagar debe ser mayor a $0.")
+                else:
+                    nuevo_saldo, _ = registrar_pago_deudor(cliente_seleccionado, monto_pago, fecha_pago.strftime("%Y-%m-%d"))
+                    
+                    if nuevo_saldo == 0.0:
+                        st.balloons()
+                        st.success(f"🎉 ¡Cuenta liquidada por completo! **{cliente_seleccionado}** ya pagó todo y **no volverá a aparecer en la lista de deudores**.")
+                    else:
+                        st.success(f"✅ ¡Abono registrado! **{cliente_seleccionado}** pagó ${monto_pago:,.2f}. Saldo restante: **${nuevo_saldo:,.2f}**.")
+                    
+                    # Limpiar estado si existía
+                    if "deudor_a_pagar" in st.session_state:
+                        del st.session_state["deudor_a_pagar"]
+                    
+                    st.rerun()
+
+    # Acordeón con historial de movimientos de fiado
+    with st.expander("📜 Ver historial reciente de fiados y pagos"):
+        df_hist_fiado = obtener_historial_fiado()
+        if df_hist_fiado.empty:
+            st.caption("Aún no hay historial de fiados registrado.")
+        else:
+            st.dataframe(df_hist_fiado, hide_index=True, use_container_width=True)
+
+# ==========================================
+# PESTAÑA 4: MÉTRICAS Y RESUMEN DEL DÍA
 # ==========================================
 with tab_metricas:
     col_t, col_f = st.columns([2, 1])
@@ -293,7 +555,7 @@ with tab_metricas:
         st.dataframe(pd.DataFrame(resumen_cat), hide_index=True, use_container_width=True)
 
 # ==========================================
-# PESTAÑA 4: HISTORIAL Y GESTIÓN
+# PESTAÑA 5: HISTORIAL Y GESTIÓN
 # ==========================================
 with tab_historial:
     st.markdown("#### 📋 Movimientos de Hoy")
