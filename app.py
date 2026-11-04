@@ -1,8 +1,8 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import datetime, date
-import os
+import requests
+import json
 
 # Configuración de página optimizada para celulares
 st.set_page_config(
@@ -68,181 +68,64 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DB_PATH = "tienda.db"
+# URL de la API de Google Apps Script vinculada a tu Google Sheet
+GSHEET_API_URL = "https://script.google.com/macros/s/AKfycbxvuRGFjjPaKunAc76G_UbMF_Kk3PLqTEvcupVuoz28OUMZYNFY-bwLi6yBOLKDpTAP/exec"
 CATEGORIAS = ["Refrescos", "Sabritas", "Galletas"]
 
-# --- FUNCIONES DE BASE DE DATOS (SQLite) ---
-def init_db():
-    """Inicializa la base de datos y todas las tablas."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # Tabla de ventas y compras diarias
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS movimientos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha TEXT NOT NULL,
-            tipo TEXT NOT NULL,
-            categoria TEXT NOT NULL,
-            cantidad INTEGER NOT NULL,
-            monto REAL NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+# --- FUNCIONES DE CONEXIÓN CON GOOGLE SHEETS ---
+
+def fetch_all_data():
+    """Descarga los datos completos desde Google Sheets vía Apps Script."""
+    try:
+        resp = requests.get(f"{GSHEET_API_URL}?action=getAll", timeout=12)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        st.error(f"Error conectando con Google Sheets: {e}")
+    return {"movimientos": [], "deudores": [], "movimientos_fiado": []}
+
+def api_post(payload):
+    """Envía un movimiento o actualización a Google Sheets."""
+    try:
+        resp = requests.post(
+            GSHEET_API_URL, 
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=15
         )
-    """)
-    # Tabla de deudores (saldos acumulados)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS deudores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT UNIQUE NOT NULL,
-            saldo REAL NOT NULL DEFAULT 0.0,
-            notas TEXT,
-            fecha_actualizacion TEXT
-        )
-    """)
-    # Historial de operaciones de fiado y pagos
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS movimientos_fiado (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL,
-            tipo TEXT NOT NULL,
-            monto REAL NOT NULL,
-            fecha TEXT NOT NULL,
-            notas TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+        return resp.status_code == 200
+    except Exception as e:
+        st.error(f"Error al guardar en Google Sheets: {e}")
+        return False
 
-def registrar_movimiento(tipo, categoria, cantidad, monto, fecha_mov):
-    """Guarda un nuevo movimiento (Venta o Compra)."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO movimientos (fecha, tipo, categoria, cantidad, monto)
-        VALUES (?, ?, ?, ?, ?)
-    """, (fecha_mov.strftime("%Y-%m-%d"), tipo, categoria, int(cantidad), float(monto)))
-    conn.commit()
-    conn.close()
+# Cargar datos desde Google Sheets en caché de sesión para agilizar
+data_gs = fetch_all_data()
 
-def obtener_movimientos(fecha_filtro=None):
-    """Obtiene movimientos, opcionalmente filtrados por fecha."""
-    conn = sqlite3.connect(DB_PATH)
-    if fecha_filtro:
-        query = "SELECT id, fecha, tipo, categoria, cantidad, monto, timestamp FROM movimientos WHERE fecha = ? ORDER BY id DESC"
-        df = pd.read_sql_query(query, conn, params=(fecha_filtro.strftime("%Y-%m-%d"),))
-    else:
-        query = "SELECT id, fecha, tipo, categoria, cantidad, monto, timestamp FROM movimientos ORDER BY id DESC"
-        df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
+# Preparar DataFrames
+df_movimientos_raw = pd.DataFrame(data_gs.get("movimientos", []))
+if not df_movimientos_raw.empty:
+    df_movimientos_raw["monto"] = pd.to_numeric(df_movimientos_raw["monto"], errors="coerce").fillna(0.0)
+    df_movimientos_raw["cantidad"] = pd.to_numeric(df_movimientos_raw["cantidad"], errors="coerce").fillna(0).astype(int)
+    # Formato de fecha estándar
+    df_movimientos_raw["fecha"] = df_movimientos_raw["fecha"].astype(str).str[:10]
 
-def eliminar_movimiento(id_mov):
-    """Elimina un movimiento por su ID."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM movimientos WHERE id = ?", (id_mov,))
-    conn.commit()
-    conn.close()
+df_deudores_raw = pd.DataFrame(data_gs.get("deudores", []))
+if not df_deudores_raw.empty:
+    df_deudores_raw["saldo"] = pd.to_numeric(df_deudores_raw["saldo"], errors="coerce").fillna(0.0)
+    df_deudores_raw["nombre"] = df_deudores_raw["nombre"].astype(str)
 
-# --- FUNCIONES PARA DEUDORES Y FIADO ---
-def registrar_fiado(nombre, monto, notas, fecha_str):
-    """Registra una nueva deuda o suma al saldo acumulado del cliente."""
-    nombre = nombre.strip().title()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Revisar si el cliente ya existe
-    cursor.execute("SELECT id, saldo FROM deudores WHERE LOWER(nombre) = LOWER(?)", (nombre,))
-    deudor = cursor.fetchone()
-    
-    if deudor:
-        deudor_id, saldo_anterior = deudor
-        nuevo_saldo = saldo_anterior + monto
-        cursor.execute("""
-            UPDATE deudores 
-            SET saldo = ?, notas = ?, fecha_actualizacion = ?
-            WHERE id = ?
-        """, (nuevo_saldo, notas, fecha_str, deudor_id))
-    else:
-        cursor.execute("""
-            INSERT INTO deudores (nombre, saldo, notas, fecha_actualizacion)
-            VALUES (?, ?, ?, ?)
-        """, (nombre, monto, notas, fecha_str))
-    
-    # Registrar en el historial de fiados
-    cursor.execute("""
-        INSERT INTO movimientos_fiado (nombre, tipo, monto, fecha, notas)
-        VALUES (?, 'Fiado (+)', ?, ?, ?)
-    """, (nombre, monto, fecha_str, notas))
-    
-    conn.commit()
-    conn.close()
-
-def registrar_pago_deudor(nombre, monto_pago, fecha_str):
-    """Abona o liquida la deuda de una persona."""
-    nombre = nombre.strip()
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT id, saldo FROM deudores WHERE LOWER(nombre) = LOWER(?)", (nombre,))
-    deudor = cursor.fetchone()
-    
-    if deudor:
-        deudor_id, saldo_actual = deudor
-        nuevo_saldo = max(0.0, saldo_actual - monto_pago)
-        
-        cursor.execute("""
-            UPDATE deudores 
-            SET saldo = ?, fecha_actualizacion = ?
-            WHERE id = ?
-        """, (nuevo_saldo, fecha_str, deudor_id))
-        
-        # Registrar en el historial
-        cursor.execute("""
-            INSERT INTO movimientos_fiado (nombre, tipo, monto, fecha, notas)
-            VALUES (?, 'Pago/Liquidación (-)', ?, ?, ?)
-        """, (nombre, monto_pago, fecha_str, f"Abono/Pago recibido: ${monto_pago:,.2f}"))
-        
-        conn.commit()
-        conn.close()
-        return nuevo_saldo, saldo_actual
-    
-    conn.close()
-    return None, None
-
-def obtener_deudores_activos():
-    """Devuelve los clientes que tienen deuda pendiente mayor a cero."""
-    conn = sqlite3.connect(DB_PATH)
-    query = "SELECT id, nombre, saldo, notas, fecha_actualizacion FROM deudores WHERE saldo > 0 ORDER BY saldo DESC, nombre ASC"
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
-
-def obtener_todos_deudores():
-    """Devuelve la lista de nombres registrados."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT nombre FROM deudores ORDER BY nombre ASC")
-    nombres = [r[0] for r in cursor.fetchall()]
-    conn.close()
-    return nombres
-
-def obtener_historial_fiado():
-    """Devuelve los últimos movimientos de fiado y pagos."""
-    conn = sqlite3.connect(DB_PATH)
-    query = "SELECT fecha, nombre, tipo, monto, notas FROM movimientos_fiado ORDER BY id DESC LIMIT 20"
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
-
-# Inicializar BD
-init_db()
+df_hist_fiado_raw = pd.DataFrame(data_gs.get("movimientos_fiado", []))
+if not df_hist_fiado_raw.empty:
+    df_hist_fiado_raw["monto"] = pd.to_numeric(df_hist_fiado_raw["monto"], errors="coerce").fillna(0.0)
 
 # --- CABECERA DE LA APP ---
 col_head1, col_head2 = st.columns([4, 1])
 with col_head1:
     st.markdown("### 🏪 Tienda de Abarrotes")
-    st.caption(f"📅 Fecha actual: **{date.today().strftime('%d/%m/%Y')}**")
+    st.caption(f"📅 Fecha: **{date.today().strftime('%d/%m/%Y')}** | ☁️ *En la nube (Google Sheets)*")
+with col_head2:
+    if st.button("🔄", help="Recargar datos de Google Sheets"):
+        st.rerun()
 
 # Selector de pestañas móvil
 tab_venta, tab_compra, tab_deudores, tab_metricas, tab_historial = st.tabs([
@@ -289,9 +172,18 @@ with tab_venta:
             if monto_venta <= 0:
                 st.error("⚠️ Por favor ingresa un monto válido mayor a $0.")
             else:
-                registrar_movimiento("Venta", cat_venta, cant_venta, monto_venta, date.today())
-                st.success(f"¡Venta registrada! +${monto_venta:,.2f} en {cat_venta} ({cant_venta} pza)")
-                st.rerun()
+                with st.spinner("Guardando en Google Sheets..."):
+                    payload = {
+                        "action": "addMovimiento",
+                        "tipo": "Venta",
+                        "categoria": cat_venta,
+                        "cantidad": int(cant_venta),
+                        "monto": float(monto_venta),
+                        "fecha": date.today().strftime("%Y-%m-%d")
+                    }
+                    if api_post(payload):
+                        st.success(f"¡Venta guardada en la nube! +${monto_venta:,.2f} en {cat_venta}")
+                        st.rerun()
 
 # ==========================================
 # PESTAÑA 2: REGISTRAR COMPRAS / GASTOS
@@ -331,9 +223,18 @@ with tab_compra:
             if monto_compra <= 0:
                 st.error("⚠️ Por favor ingresa un costo válido mayor a $0.")
             else:
-                registrar_movimiento("Compra/Gasto", cat_compra, cant_compra, monto_compra, date.today())
-                st.success(f"¡Compra registrada! -${monto_compra:,.2f} en {cat_compra} ({cant_compra} pza)")
-                st.rerun()
+                with st.spinner("Guardando en Google Sheets..."):
+                    payload = {
+                        "action": "addMovimiento",
+                        "tipo": "Compra/Gasto",
+                        "categoria": cat_compra,
+                        "cantidad": int(cant_compra),
+                        "monto": float(monto_compra),
+                        "fecha": date.today().strftime("%Y-%m-%d")
+                    }
+                    if api_post(payload):
+                        st.success(f"¡Compra guardada en la nube! -${monto_compra:,.2f} en {cat_compra}")
+                        st.rerun()
 
 # ==========================================
 # PESTAÑA 3: DEUDORES / LO FIADO
@@ -341,7 +242,6 @@ with tab_compra:
 with tab_deudores:
     st.markdown("#### 📒 Control de Deudores y Fiado")
     
-    # Subpestañas o acordeones para organizar celular
     accion_fiado = st.radio(
         "¿Qué deseas hacer?",
         ["👥 Ver Deudores Activos", "➕ Anotar Fiado", "💳 Registrar Pago"],
@@ -349,7 +249,12 @@ with tab_deudores:
         label_visibility="collapsed"
     )
     
-    df_activos = obtener_deudores_activos()
+    # Filtrar solo deudores con saldo > 0
+    if not df_deudores_raw.empty:
+        df_activos = df_deudores_raw[df_deudores_raw["saldo"] > 0].sort_values(by="saldo", ascending=False)
+    else:
+        df_activos = pd.DataFrame()
+
     total_por_cobrar = df_activos["saldo"].sum() if not df_activos.empty else 0.0
     
     # Métrica resumen del fiado
@@ -376,30 +281,28 @@ with tab_deudores:
                             <span style="font-size:1.25rem; font-weight:800; color:#dc2626;">${row['saldo']:,.2f}</span>
                         </div>
                         <div style="font-size:0.85rem; color:#64748b; margin-top:4px;">
-                            📅 Última fecha: {row['fecha_actualizacion'] or 'Reciente'}
-                            {f"<br>📝 Notas: {row['notas']}" if row['notas'] else ""}
+                            📅 Última fecha: {row.get('fecha_actualizacion', 'Reciente')}
+                            {f"<br>📝 Notas: {row.get('notas', '')}" if row.get('notas') else ""}
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Botón rápido para ir directo a pagar esta persona
-                    if st.button(f"💵 Pagar cuenta de {row['nombre']}", key=f"btn_pay_{row['id']}"):
+                    if st.button(f"💵 Pagar cuenta de {row['nombre']}", key=f"btn_pay_{row['nombre']}"):
                         st.session_state["deudor_a_pagar"] = row["nombre"]
-                        st.session_state["saldo_a_pagar"] = float(row["saldo"])
                         st.rerun()
 
     # --- SECCIÓN 2: ANOTAR NUEVO FIADO O ACUMULAR ---
     elif accion_fiado == "➕ Anotar Fiado":
         st.markdown("##### 📝 Anotar mercancía fiada")
         
-        nombres_existentes = obtener_todos_deudores()
+        nombres_existentes = df_deudores_raw["nombre"].tolist() if not df_deudores_raw.empty else []
         usar_existente = False
         nombre_cliente = ""
         
         if nombres_existentes:
             modo_nombre = st.radio("Seleccionar cliente:", ["Escribir nuevo", "Elegir existente"], horizontal=True)
             if modo_nombre == "Elegir existente":
-                nombre_cliente = st.selectbox("Cliente:", options=nombres_existentes)
+                nombre_cliente = st.selectbox("Cliente:", options=sorted(nombres_existentes))
                 usar_existente = True
                 
         if not usar_existente:
@@ -415,9 +318,17 @@ with tab_deudores:
             elif monto_fiado <= 0:
                 st.error("⚠️ El monto fiado debe ser mayor a $0.")
             else:
-                registrar_fiado(nombre_cliente, monto_fiado, notas_fiado, fecha_fiado.strftime("%Y-%m-%d"))
-                st.success(f"¡Anotado con éxito! Se sumaron ${monto_fiado:,.2f} a la cuenta de {nombre_cliente.title()}.")
-                st.rerun()
+                with st.spinner("Guardando en Google Sheets..."):
+                    payload = {
+                        "action": "addFiado",
+                        "nombre": nombre_cliente.strip().title(),
+                        "monto": float(monto_fiado),
+                        "notas": notas_fiado,
+                        "fecha": fecha_fiado.strftime("%Y-%m-%d")
+                    }
+                    if api_post(payload):
+                        st.success(f"¡Anotado! Se sumaron ${monto_fiado:,.2f} a la cuenta de {nombre_cliente.title()}.")
+                        st.rerun()
 
     # --- SECCIÓN 3: REGISTRAR PAGO / SALDAR CUENTA ---
     elif accion_fiado == "💳 Registrar Pago":
@@ -426,17 +337,14 @@ with tab_deudores:
         if df_activos.empty:
             st.info("No hay clientes con saldo pendiente en este momento.")
         else:
-            # Lista de deudores activos para cobrarles
             nombres_activos = df_activos["nombre"].tolist()
             
-            # Si venía redirigido por el botón de pagar
             index_defecto = 0
             if "deudor_a_pagar" in st.session_state and st.session_state["deudor_a_pagar"] in nombres_activos:
                 index_defecto = nombres_activos.index(st.session_state["deudor_a_pagar"])
                 
             cliente_seleccionado = st.selectbox("Selecciona la persona que va a pagar:", options=nombres_activos, index=index_defecto)
             
-            # Obtener saldo actual de la persona seleccionada
             fila_cliente = df_activos[df_activos["nombre"] == cliente_seleccionado].iloc[0]
             saldo_pendiente = float(fila_cliente["saldo"])
             
@@ -458,27 +366,31 @@ with tab_deudores:
                 if monto_pago <= 0:
                     st.error("⚠️ El monto a pagar debe ser mayor a $0.")
                 else:
-                    nuevo_saldo, _ = registrar_pago_deudor(cliente_seleccionado, monto_pago, fecha_pago.strftime("%Y-%m-%d"))
-                    
-                    if nuevo_saldo == 0.0:
-                        st.balloons()
-                        st.success(f"🎉 ¡Cuenta liquidada por completo! **{cliente_seleccionado}** ya pagó todo y **no volverá a aparecer en la lista de deudores**.")
-                    else:
-                        st.success(f"✅ ¡Abono registrado! **{cliente_seleccionado}** pagó ${monto_pago:,.2f}. Saldo restante: **${nuevo_saldo:,.2f}**.")
-                    
-                    # Limpiar estado si existía
-                    if "deudor_a_pagar" in st.session_state:
-                        del st.session_state["deudor_a_pagar"]
-                    
-                    st.rerun()
+                    with st.spinner("Actualizando en Google Sheets..."):
+                        payload = {
+                            "action": "payFiado",
+                            "nombre": cliente_seleccionado,
+                            "monto": float(monto_pago),
+                            "fecha": fecha_pago.strftime("%Y-%m-%d")
+                        }
+                        if api_post(payload):
+                            if monto_pago >= saldo_pendiente:
+                                st.balloons()
+                                st.success(f"🎉 ¡Cuenta liquidada por completo! **{cliente_seleccionado}** ya no aparece en la lista de deudores.")
+                            else:
+                                st.success(f"✅ ¡Abono registrado! Saldo restante: **${(saldo_pendiente - monto_pago):,.2f}**.")
+                            
+                            if "deudor_a_pagar" in st.session_state:
+                                del st.session_state["deudor_a_pagar"]
+                            st.rerun()
 
     # Acordeón con historial de movimientos de fiado
     with st.expander("📜 Ver historial reciente de fiados y pagos"):
-        df_hist_fiado = obtener_historial_fiado()
-        if df_hist_fiado.empty:
+        if df_hist_fiado_raw.empty:
             st.caption("Aún no hay historial de fiados registrado.")
         else:
-            st.dataframe(df_hist_fiado, hide_index=True, use_container_width=True)
+            cols_show = [c for c in ["fecha", "nombre", "tipo", "monto", "notas"] if c in df_hist_fiado_raw.columns]
+            st.dataframe(df_hist_fiado_raw[cols_show].tail(25).iloc[::-1], hide_index=True, use_container_width=True)
 
 # ==========================================
 # PESTAÑA 4: MÉTRICAS Y RESUMEN DEL DÍA
@@ -490,8 +402,12 @@ with tab_metricas:
     with col_f:
         fecha_seleccionada = st.date_input("Fecha:", value=date.today(), label_visibility="collapsed")
     
-    # Obtener datos del día seleccionado
-    df_dia = obtener_movimientos(fecha_filtro=fecha_seleccionada)
+    fecha_str = fecha_seleccionada.strftime("%Y-%m-%d")
+    
+    if not df_movimientos_raw.empty:
+        df_dia = df_movimientos_raw[df_movimientos_raw["fecha"] == fecha_str]
+    else:
+        df_dia = pd.DataFrame()
     
     if df_dia.empty:
         st.info(f"No hay movimientos registrados para el {fecha_seleccionada.strftime('%d/%m/%Y')}.")
@@ -509,17 +425,10 @@ with tab_metricas:
     # Panel de métricas principales
     m1, m2 = st.columns(2)
     with m1:
-        st.metric(
-            label="💵 Total Vendido", 
-            value=f"${total_ventas:,.2f}"
-        )
+        st.metric(label="💵 Total Vendido", value=f"${total_ventas:,.2f}")
     with m2:
-        st.metric(
-            label="🛒 Total Comprado", 
-            value=f"${total_compras:,.2f}"
-        )
+        st.metric(label="🛒 Total Comprado", value=f"${total_compras:,.2f}")
     
-    # Métrica destacada de Ganancia Neta
     delta_color = "normal" if ganancia_neta >= 0 else "inverse"
     st.metric(
         label="🎯 Ganancia Neta del Día",
@@ -559,15 +468,21 @@ with tab_metricas:
 # ==========================================
 with tab_historial:
     st.markdown("#### 📋 Movimientos de Hoy")
-    df_hoy = obtener_movimientos(fecha_filtro=date.today())
+    fecha_hoy_str = date.today().strftime("%Y-%m-%d")
+    
+    if not df_movimientos_raw.empty:
+        df_hoy = df_movimientos_raw[df_movimientos_raw["fecha"] == fecha_hoy_str]
+    else:
+        df_hoy = pd.DataFrame()
     
     if df_hoy.empty:
         st.caption("Aún no has registrado movimientos hoy.")
     else:
         st.write(f"Total registros hoy: **{len(df_hoy)}**")
-        for _, row in df_hoy.iterrows():
+        for _, row in df_hoy.iloc[::-1].iterrows():
             icono = "💵" if row["tipo"] == "Venta" else "🛒"
             color = "#16a34a" if row["tipo"] == "Venta" else "#dc2626"
+            row_idx = row.get("_row_idx")
             
             with st.container():
                 col_info, col_del = st.columns([5, 1])
@@ -578,8 +493,9 @@ with tab_historial:
                         unsafe_allow_html=True
                     )
                 with col_del:
-                    if st.button("🗑️", key=f"del_{row['id']}", help="Eliminar este registro"):
-                        eliminar_movimiento(row['id'])
-                        st.toast("Movimiento eliminado correctamente")
-                        st.rerun()
+                    if row_idx is not None and st.button("🗑️", key=f"del_{row_idx}", help="Eliminar este registro de Google Sheets"):
+                        with st.spinner("Eliminando..."):
+                            api_post({"action": "deleteMovimiento", "row_idx": int(row_idx)})
+                            st.toast("Movimiento eliminado en Google Sheets")
+                            st.rerun()
                 st.markdown("<hr style='margin: 4px 0 10px 0; border: none; border-top: 1px dashed #e2e8f0;'>", unsafe_allow_html=True)
